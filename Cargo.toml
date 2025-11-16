@@ -1,0 +1,6 @@
+[workspace]
+members = ["porrocket", "porrocket-hook"]
+resolver = "2"
+
+[workspace.dependencies]
+libc = "0.2"
