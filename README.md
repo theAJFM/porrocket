@@ -78,15 +78,33 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Building from Source
 
 ```bash
-# Build the release version
+# Clone the repository
+git clone https://github.com/yourusername/porrocket.git
+cd porrocket
+
+# Build and install (recommended)
+./install.sh
+
+# Or run directly from build directory without installing
 cargo build --release
-
-# Install to ~/.cargo/bin (recommended)
-cargo install --path porrocket
-
-# Or run directly from build directory
 ./target/release/porrocket -p 4312 -u /tmp/app.sock -- your-command
 ```
+
+The install script will:
+- Build the release version
+- Install `porrocket` binary to `~/.cargo/bin/`
+- Install `libporrocket_hook.so` to the same directory
+- Verify your PATH is configured correctly
+
+**Note:** Do not use `cargo install --path porrocket` as it only installs the binary, not the required shared library.
+
+### Uninstalling
+
+```bash
+./uninstall.sh
+```
+
+This will remove both the binary and the shared library from `~/.cargo/bin/`.
 
 ## Quick Test
 
