@@ -2,12 +2,5 @@
 /target
 Cargo.lock
 
-# Test files
-test_server.py
-test_server.c
-test_server
-test_env.c
-test_env
-
 # Unix sockets
 *.sock

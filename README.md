@@ -90,46 +90,33 @@ cargo install --path porrocket
 
 ## Quick Test
 
-Create a simple Python HTTP server:
+See the [examples/](examples/) directory for working server examples.
 
+**Node.js (recommended):**
 ```bash
-cat > test_server.py << 'EOF'
-#!/usr/bin/env python3
-import http.server
-import socketserver
-import sys
+# Run the Node.js example
+porrocket -p 4312 -u /tmp/node.sock -- node examples/simple_node.js 4312
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-Handler = http.server.SimpleHTTPRequestHandler
-
-with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
-    print(f"Server listening on port {PORT}")
-    httpd.serve_forever()
-EOF
-
-chmod +x test_server.py
+# Test in another terminal
+curl --unix-socket /tmp/node.sock http://localhost/
 ```
 
-Run it with porrocket:
-
+**Python:**
 ```bash
-# Start the server (redirects port 4312 to Unix socket)
-porrocket -p 4312 -u /tmp/test.sock -- python3 test_server.py 4312
+# Run the Python example
+porrocket -p 4312 -u /tmp/python.sock -- python3 examples/simple_python.py 4312
+
+# Test in another terminal
+curl --unix-socket /tmp/python.sock http://localhost/
 ```
 
-In another terminal, verify:
-
+Verify it's working:
 ```bash
 # Check that the Unix socket was created
-ls -la /tmp/test.sock
+ls -la /tmp/node.sock
 
 # Check that port 4312 is NOT in use
-sudo netstat -tulpn | grep 4312  # Should show nothing
-# or
 lsof -i :4312  # Should show nothing
-
-# Connect via the Unix socket
-curl --unix-socket /tmp/test.sock http://localhost/
 ```
 
 ## Architecture
@@ -139,6 +126,26 @@ The project consists of two components:
 1. **porrocket** (binary): CLI tool that spawns the target command with the hook library injected via `LD_PRELOAD`
 2. **porrocket-hook** (shared library): `.so` file that intercepts `bind()` calls and redirects them to Unix sockets
 
+## Runtime Compatibility
+
+### ✅ Known Working
+
+- **Node.js** - Works well, recommended
+- **Python (custom servers)** - Works with manual socket handling (see examples)
+- **Simple C/C++ servers** - Usually works
+- **Go applications** - Generally works
+- **Rust (tokio/std)** - Usually works
+
+### ❌ Known Incompatible
+
+- **Deno** - Strict socket validation prevents compatibility
+- **Python http.server** - Crashes on client address logging
+- **Static binaries** - No libc to hook
+- **Setuid/setgid binaries** - Security restriction
+- **Applications with seccomp filters** - May block LD_PRELOAD
+
+**See [examples/README.md](examples/README.md) for detailed compatibility notes and working code samples.**
+
 ## Limitations
 
 1. **Only intercepts IPv4 TCP bindings**: Currently only hooks `AF_INET` family bindings
@@ -146,6 +153,7 @@ The project consists of two components:
 3. **No IPv6 support**: `AF_INET6` bindings are not intercepted
 4. **Socket API only**: Only works with applications using standard POSIX socket APIs
 5. **No traffic proxying**: The tool only redirects bindings; it doesn't proxy traffic between TCP and Unix sockets. If you need external clients to connect, you'll need a separate proxy/socat setup.
+6. **Application compatibility**: Some applications crash when they try to inspect client addresses or perform TCP-specific operations on Unix sockets
 
 ## Use Cases
 
