@@ -45,17 +45,17 @@ This will make the Node.js process bind to `/tmp/app.sock` instead of port 4312.
 
 ### What Works
 
-✅ Dynamically linked binaries
-✅ Interpreted languages (Python, Node.js, Ruby, PHP, etc.)
-✅ Most application servers (nginx, Apache, etc.)
-✅ Any program using standard POSIX `bind()` calls
+- ✅ Dynamically linked binaries
+- ✅ Interpreted languages (Python, Node.js, Ruby, PHP, etc.)
+- ✅ Most application servers (nginx, Apache, etc.)
+- ✅ Any program using standard POSIX `bind()` calls
 
 ### What Doesn't Work
 
-❌ Statically linked binaries
-❌ Binaries with `setuid`/`setgid` bits (security restriction)
-❌ Programs using `seccomp` or other security sandboxing
-❌ Programs that don't use the standard `bind()` syscall
+- ❌ Statically linked binaries
+- ❌ Binaries with `setuid`/`setgid` bits (security restriction)
+- ❌ Programs using `seccomp` or other security sandboxing
+- ❌ Programs that don't use the standard `bind()` syscall
 
 ### Why Not macOS/Windows?
 
