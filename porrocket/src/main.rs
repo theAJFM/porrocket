@@ -1,8 +1,13 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "porrocket")]
@@ -43,6 +48,15 @@ fn get_hook_library_path() -> Result<PathBuf> {
     Ok(lib_path)
 }
 
+fn cleanup_socket(socket_path: &PathBuf) {
+    if socket_path.exists() {
+        match fs::remove_file(socket_path) {
+            Ok(_) => eprintln!("[porrocket] Cleaned up socket file: {}", socket_path.display()),
+            Err(e) => eprintln!("[porrocket] Failed to clean up socket file: {}", e),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -54,6 +68,13 @@ fn main() -> Result<()> {
     // Get the hook library path
     let hook_lib = get_hook_library_path()
         .context("Failed to locate hook library")?;
+
+    // Setup signal handlers for cleanup
+    let term = Arc::new(AtomicBool::new(false));
+    let socket_path_for_signal = args.socket.clone();
+
+    flag::register(SIGTERM, Arc::clone(&term))?;
+    flag::register(SIGINT, Arc::clone(&term))?;
 
     // Extract command and arguments
     let (cmd, cmd_args) = args.command.split_first().unwrap();
@@ -73,6 +94,15 @@ fn main() -> Result<()> {
     let status = command
         .status()
         .context("Failed to execute command")?;
+
+    // Clean up socket file after child exits
+    cleanup_socket(&args.socket);
+
+    // Check if we received a signal during execution
+    if term.load(Ordering::Relaxed) {
+        cleanup_socket(&socket_path_for_signal);
+        std::process::exit(130); // Standard exit code for SIGINT
+    }
 
     // Exit with the same status code as the child process
     std::process::exit(status.code().unwrap_or(1));
