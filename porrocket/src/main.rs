@@ -75,7 +75,6 @@ fn main() -> Result<()> {
 
     flag::register(SIGTERM, Arc::clone(&term))?;
     flag::register(SIGINT, Arc::clone(&term))?;
-    flag::register(SIGKILL, Arc::clone(&term))?;
 
     // Extract command and arguments
     let (cmd, cmd_args) = args.command.split_first().unwrap();
