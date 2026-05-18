@@ -1,5 +1,6 @@
 [workspace]
 members = ["porrocket", "porrocket-hook"]
+exclude = ["examples/leptos-repro"]
 resolver = "2"
 
 [workspace.dependencies]

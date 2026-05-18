@@ -37,6 +37,21 @@ fn untrack_converted_socket(fd: c_int) {
     }
 }
 
+/// Overwrite a sockaddr buffer with fake loopback TCP peer info (127.0.0.1:0).
+/// Used so that runtimes converting an accepted connection's address to a
+/// `SocketAddr` see AF_INET instead of the real AF_UNIX address.
+unsafe fn write_fake_peer(addr: *mut sockaddr, addrlen: *mut socklen_t) {
+    if addr.is_null() || addrlen.is_null() {
+        return;
+    }
+    let fake_addr = addr as *mut sockaddr_in;
+    ptr::write_bytes(fake_addr, 0, 1);
+    (*fake_addr).sin_family = (AF_INET as u8).into();
+    (*fake_addr).sin_port = 0;
+    (*fake_addr).sin_addr.s_addr = libc::htonl(libc::INADDR_LOOPBACK);
+    *addrlen = mem::size_of::<sockaddr_in>() as socklen_t;
+}
+
 /// Initialize by reading environment variables
 unsafe fn initialize() {
     INIT.call_once(|| {
@@ -140,6 +155,21 @@ unsafe fn orig_close(fd: c_int) -> c_int {
     f(fd)
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn orig_accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"accept\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
+    }
+    let f: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int = mem::transmute(sym);
+    f(fd, addr, len)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn orig_accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    libc::accept(fd, addr, len)
+}
+
 // ---------------------------------------------------------------------------
 // Shared hook implementations (platform-independent logic)
 // ---------------------------------------------------------------------------
@@ -177,6 +207,13 @@ unsafe fn hook_bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) ->
                 return -1;
             }
 
+            // Capture the original socket's file-status and fd flags. dup2
+            // does NOT copy these, so without restoring them O_NONBLOCK and
+            // FD_CLOEXEC (which async runtimes like tokio set on the listener)
+            // would be silently lost when the Unix socket takes over the fd.
+            let saved_fl = libc::fcntl(sockfd, libc::F_GETFL);
+            let saved_fd = libc::fcntl(sockfd, libc::F_GETFD);
+
             // Duplicate the new socket onto the old file descriptor
             if libc::dup2(new_sockfd, sockfd) < 0 {
                 libc::write(
@@ -190,6 +227,14 @@ unsafe fn hook_bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) ->
 
             // Close the temporary socket fd
             libc::close(new_sockfd);
+
+            // Restore the original fd flags onto the swapped-in Unix socket.
+            if saved_fl >= 0 {
+                libc::fcntl(sockfd, libc::F_SETFL, saved_fl);
+            }
+            if saved_fd >= 0 {
+                libc::fcntl(sockfd, libc::F_SETFD, saved_fd);
+            }
 
             // Track this socket as converted
             track_converted_socket(sockfd);
@@ -296,6 +341,31 @@ unsafe fn hook_getpeername(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut soc
     orig_getpeername(sockfd, addr, addrlen)
 }
 
+/// accept() hook: a connection accepted from a converted (Unix socket)
+/// listener carries an AF_UNIX peer address. Runtimes such as tokio reject
+/// that address when converting it to a TCP `SocketAddr` and silently drop
+/// the connection, so rewrite it to a fake loopback TCP peer.
+///
+/// The accepted fd itself is intentionally NOT tracked: accepted connections
+/// are short-lived and their fd numbers get reused, and close() cannot be
+/// safely interposed on macOS (re-entrancy during early dyld startup). HTTP
+/// servers read/write the accepted connection directly and do not re-query
+/// its address, so faking the address at accept() time is sufficient.
+unsafe fn hook_accept(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
+    let result = orig_accept(sockfd, addr, addrlen);
+
+    if result >= 0 && is_converted_socket(sockfd) {
+        write_fake_peer(addr, addrlen);
+        libc::write(
+            2,
+            b"[porrocket] accept() on converted socket, faked peer\n".as_ptr() as *const _,
+            53,
+        );
+    }
+
+    result
+}
+
 /// close() hook: stop tracking a converted socket when it is closed.
 #[cfg(target_os = "linux")]
 unsafe fn hook_close(fd: c_int) -> c_int {
@@ -338,6 +408,39 @@ pub unsafe extern "C" fn getpeername(
 #[no_mangle]
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     hook_close(fd)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn accept(
+    sockfd: c_int,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
+) -> c_int {
+    hook_accept(sockfd, addr, addrlen)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn accept4(
+    sockfd: c_int,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
+    flags: c_int,
+) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"accept4\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
+    }
+    let orig: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t, c_int) -> c_int =
+        mem::transmute(sym);
+    let result = orig(sockfd, addr, addrlen, flags);
+
+    if result >= 0 && is_converted_socket(sockfd) {
+        write_fake_peer(addr, addrlen);
+    }
+
+    result
 }
 
 /// getsockopt() hook (Linux only): report AF_INET as the socket domain so that
@@ -419,10 +522,20 @@ unsafe extern "C" fn porrocket_getpeername(
     hook_getpeername(sockfd, addr, addrlen)
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn porrocket_accept(
+    sockfd: c_int,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
+) -> c_int {
+    hook_accept(sockfd, addr, addrlen)
+}
+
 // NOTE: close() is intentionally NOT interposed on macOS. It is called
 // constantly and very early in process startup; interposing it risks
-// re-entrancy during dyld/libsystem initialization. Converted sockets are
-// long-lived listeners, so skipping close-tracking is harmless here.
+// re-entrancy during dyld/libsystem initialization. Accepted converted
+// sockets are therefore not tracked on macOS — the accept() hook fakes the
+// peer address at accept time, which is all HTTP servers need.
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -457,6 +570,15 @@ static INTERPOSE_GETPEERNAME: Interpose = Interpose {
     replacement: porrocket_getpeername as *const (),
     original: libc::getpeername as *const (),
 };
+
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__interpose"]
+static INTERPOSE_ACCEPT: Interpose = Interpose {
+    replacement: porrocket_accept as *const (),
+    original: libc::accept as *const (),
+};
+
 
 // ---------------------------------------------------------------------------
 // Constructor: runs when the library is loaded, before the target's main().

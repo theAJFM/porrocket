@@ -42,7 +42,7 @@ This will make the Node.js process bind to `/tmp/app.sock` instead of port 4312.
 specified port, the hook redirects it to bind to a Unix domain socket instead.
 
 - **Linux:** the hook library is injected via `LD_PRELOAD` and shadows the libc
-  `bind()`/`getsockname()`/`getpeername()`/`getsockopt()`/`close()` symbols.
+  `bind()`/`accept()`/`accept4()`/`getsockname()`/`getpeername()`/`getsockopt()`/`close()` symbols.
 - **macOS:** the hook library is injected via `DYLD_INSERT_LIBRARIES` and wired
   up through the dyld `__interpose` table, which works correctly with macOS's
   two-level namespaces.
@@ -178,7 +178,7 @@ The project consists of two components:
 - **Python (custom servers)** - Works with manual socket handling (see examples)
 - **Simple C/C++ servers** - Usually works
 - **Go applications** - Generally works
-- **Rust (tokio/std)** - Usually works
+- **Rust (tokio/std)** - Generally works. Tested on axum + leptos (see [examples/leptos-repro](examples/leptos-repro/))
 
 ### ❌ Known Incompatible
 

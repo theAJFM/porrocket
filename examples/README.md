@@ -38,6 +38,32 @@ curl --unix-socket /tmp/python.sock http://localhost/
 
 ---
 
+### Rust / axum (Leptos SSR)
+
+**Directory:** `leptos-repro/`
+
+```bash
+# Build the minimal axum server
+cd leptos-repro && cargo build --release && cd ..
+
+# Run with porrocket
+porrocket -p 4312 -u /tmp/leptos.sock -- ./leptos-repro/target/release/leptos-repro 4312
+
+# Test in another terminal
+curl --unix-socket /tmp/leptos.sock http://localhost/
+```
+
+**Why it works:** axum/hyper run on tokio, which — unlike Node — converts an
+accepted connection's peer address into a strict `SocketAddr`. A raw `AF_UNIX`
+address makes tokio reject and drop the connection (the "Empty reply from
+server" symptom). porrocket's `accept()` hook rewrites the peer address of
+connections accepted from a converted listener to a fake loopback TCP address,
+so tokio accepts them. This is the same stack a real `cargo-leptos` SSR app
+uses, so Leptos SSR servers work too — run the generated server binary under
+porrocket on its `site-addr` port.
+
+---
+
 ## ❌ Known Incompatible Runtimes
 
 ### Python's http.server Module
