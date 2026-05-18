@@ -4,7 +4,9 @@ use std::mem;
 use std::ptr;
 use std::sync::{Mutex, Once};
 
-// SO_DOMAIN is not in libc crate, define it manually
+// SO_DOMAIN is a Linux-only socket option (not in the libc crate, define it
+// manually). macOS has no equivalent, so the getsockopt hook is Linux-only.
+#[cfg(target_os = "linux")]
 const SO_DOMAIN: c_int = 39;
 
 static INIT: Once = Once::new();
@@ -27,6 +29,7 @@ fn is_converted_socket(fd: c_int) -> bool {
     guard.as_ref().map_or(false, |set| set.contains(&fd))
 }
 
+#[cfg(target_os = "linux")] // only the Linux close() hook untracks sockets
 fn untrack_converted_socket(fd: c_int) {
     let mut guard = CONVERTED_SOCKETS.lock().unwrap();
     if let Some(set) = guard.as_mut() {
@@ -58,25 +61,91 @@ unsafe fn initialize() {
             let msg = format!("[porrocket] Socket path: {}\n", path);
             libc::write(2, msg.as_ptr() as *const _, msg.len());
         }
+
+        // Drop a marker file so the porrocket launcher can detect whether the
+        // hook was actually loaded into the target (on macOS, dyld silently
+        // strips DYLD_INSERT_LIBRARIES for restricted/SIP-protected binaries).
+        if let Ok(marker) = std::env::var("PORROCKET_MARKER") {
+            let _ = std::fs::write(&marker, b"loaded");
+        }
     });
 }
 
-// Original bind function pointer type
-type BindFn = unsafe extern "C" fn(c_int, *const sockaddr, socklen_t) -> c_int;
+// ---------------------------------------------------------------------------
+// Original-function resolution
+//
+// Linux: the hook shadows libc symbols via LD_PRELOAD, so the genuine
+// implementations are fetched with dlsym(RTLD_NEXT, ...). dlsym yields a raw
+// pointer, so calling it skips the shadowed symbol.
+//
+// macOS: the hook is wired up through the dyld __interpose table. dyld does
+// NOT interpose references made *from within the interposing image itself*
+// (this is the documented DYLD_INTERPOSE contract), so a direct call to
+// `libc::bind` here reaches the real libc. dlsym must NOT be used on macOS:
+// dlsym(RTLD_NEXT, ...) returns the *interposed* symbol and would recurse.
+// ---------------------------------------------------------------------------
 
-// Get the original bind function
-unsafe fn get_original_bind() -> BindFn {
-    let bind_symbol = b"bind\0".as_ptr() as *const i8;
-    let original = libc::dlsym(libc::RTLD_NEXT, bind_symbol);
-    if original.is_null() {
-        panic!("Failed to load original bind");
+#[cfg(target_os = "linux")]
+unsafe fn orig_bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"bind\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
     }
-    mem::transmute(original)
+    let f: unsafe extern "C" fn(c_int, *const sockaddr, socklen_t) -> c_int = mem::transmute(sym);
+    f(fd, addr, len)
 }
 
-/// Our bind() replacement
-#[no_mangle]
-pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
+#[cfg(target_os = "macos")]
+unsafe fn orig_bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
+    libc::bind(fd, addr, len)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn orig_getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"getsockname\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
+    }
+    let f: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int = mem::transmute(sym);
+    f(fd, addr, len)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn orig_getsockname(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    libc::getsockname(fd, addr, len)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn orig_getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"getpeername\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
+    }
+    let f: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int = mem::transmute(sym);
+    f(fd, addr, len)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn orig_getpeername(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
+    libc::getpeername(fd, addr, len)
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn orig_close(fd: c_int) -> c_int {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"close\0".as_ptr() as *const _);
+    if sym.is_null() {
+        return -1;
+    }
+    let f: unsafe extern "C" fn(c_int) -> c_int = mem::transmute(sym);
+    f(fd)
+}
+
+// ---------------------------------------------------------------------------
+// Shared hook implementations (platform-independent logic)
+// ---------------------------------------------------------------------------
+
+/// bind() hook: redirect a TCP bind on the target port to a Unix socket.
+unsafe fn hook_bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
     initialize();
 
     libc::write(2, b"[porrocket] bind() intercepted\n".as_ptr() as *const _, 31);
@@ -129,24 +198,31 @@ pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: soc
             let mut unix_addr: sockaddr_un = mem::zeroed();
             unix_addr.sun_family = (AF_UNIX as u8).into();
 
-            // Copy the path
+            // Copy the path (clamp to the platform's sun_path size: 108 bytes
+            // on Linux, 104 on macOS; reserve 1 byte for the null terminator).
             let socket_path_ptr = ptr::addr_of!(SOCKET_PATH) as *const u8;
-            let path_len = (0..108)
+            let max_path = unix_addr.sun_path.len() - 1;
+            let path_len = (0..max_path)
                 .find(|&i| *socket_path_ptr.add(i) == 0)
-                .unwrap_or(107);
+                .unwrap_or(max_path);
             ptr::copy_nonoverlapping(
-                socket_path_ptr as *const i8,
+                socket_path_ptr as *const _,
                 unix_addr.sun_path.as_mut_ptr(),
                 path_len,
             );
 
+            // macOS sockaddr_un carries a length byte; Linux's does not.
+            #[cfg(target_os = "macos")]
+            {
+                unix_addr.sun_len = mem::size_of::<sockaddr_un>() as u8;
+            }
+
             // Remove existing socket file if it exists
-            let _ = libc::unlink(socket_path_ptr as *const i8);
+            let _ = libc::unlink(socket_path_ptr as *const _);
 
             // Bind to Unix socket
             let unix_addr_len = mem::size_of::<sockaddr_un>() as socklen_t;
-            let original_bind = get_original_bind();
-            let result = original_bind(
+            let result = orig_bind(
                 sockfd,
                 &unix_addr as *const sockaddr_un as *const sockaddr,
                 unix_addr_len,
@@ -171,52 +247,102 @@ pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: soc
     }
 
     // Not our target port, use original bind
-    let original_bind = get_original_bind();
-    original_bind(sockfd, addr, addrlen)
+    orig_bind(sockfd, addr, addrlen)
 }
 
-/// Intercept getsockname to return fake TCP address for converted sockets
+/// getsockname() hook: return fake TCP address info for converted sockets.
+unsafe fn hook_getsockname(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
+    initialize();
+
+    if is_converted_socket(sockfd) && !addr.is_null() && !addrlen.is_null() {
+        let fake_addr = addr as *mut sockaddr_in;
+        ptr::write_bytes(fake_addr, 0, 1);
+        (*fake_addr).sin_family = (AF_INET as u8).into();
+        (*fake_addr).sin_port = TARGET_PORT.to_be();
+        (*fake_addr).sin_addr.s_addr = 0; // 0.0.0.0
+        *addrlen = mem::size_of::<sockaddr_in>() as socklen_t;
+
+        libc::write(
+            2,
+            b"[porrocket] getsockname() returning fake TCP info\n".as_ptr() as *const _,
+            50,
+        );
+        return 0;
+    }
+
+    orig_getsockname(sockfd, addr, addrlen)
+}
+
+/// getpeername() hook: return fake TCP peer info for converted sockets.
+unsafe fn hook_getpeername(sockfd: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t) -> c_int {
+    initialize();
+
+    if is_converted_socket(sockfd) && !addr.is_null() && !addrlen.is_null() {
+        let fake_addr = addr as *mut sockaddr_in;
+        ptr::write_bytes(fake_addr, 0, 1);
+        (*fake_addr).sin_family = (AF_INET as u8).into();
+        (*fake_addr).sin_port = 0;
+        (*fake_addr).sin_addr.s_addr = libc::htonl(libc::INADDR_LOOPBACK);
+        *addrlen = mem::size_of::<sockaddr_in>() as socklen_t;
+
+        libc::write(
+            2,
+            b"[porrocket] getpeername() returning fake TCP peer\n".as_ptr() as *const _,
+            50,
+        );
+        return 0;
+    }
+
+    orig_getpeername(sockfd, addr, addrlen)
+}
+
+/// close() hook: stop tracking a converted socket when it is closed.
+#[cfg(target_os = "linux")]
+unsafe fn hook_close(fd: c_int) -> c_int {
+    untrack_converted_socket(fd);
+    orig_close(fd)
+}
+
+// ---------------------------------------------------------------------------
+// Linux: export the hooks under the real libc symbol names. LD_PRELOAD makes
+// these shadow libc, and the getsockopt hook masks the Unix socket's domain.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn bind(sockfd: c_int, addr: *const sockaddr, addrlen: socklen_t) -> c_int {
+    hook_bind(sockfd, addr, addrlen)
+}
+
+#[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn getsockname(
     sockfd: c_int,
     addr: *mut sockaddr,
     addrlen: *mut socklen_t,
 ) -> c_int {
-    initialize();
-
-    // Get the original function
-    let getsockname_symbol = b"getsockname\0".as_ptr() as *const i8;
-    let original = libc::dlsym(libc::RTLD_NEXT, getsockname_symbol);
-    if original.is_null() {
-        return -1;
-    }
-    let original_getsockname: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int =
-        mem::transmute(original);
-
-    // If this is a converted socket, return fake TCP info
-    if is_converted_socket(sockfd) {
-        if !addr.is_null() && !addrlen.is_null() {
-            let fake_addr = addr as *mut sockaddr_in;
-            ptr::write_bytes(fake_addr, 0, 1);
-            (*fake_addr).sin_family = (AF_INET as u8).into();
-            (*fake_addr).sin_port = TARGET_PORT.to_be();
-            (*fake_addr).sin_addr.s_addr = 0; // 0.0.0.0
-            *addrlen = mem::size_of::<sockaddr_in>() as socklen_t;
-
-            libc::write(
-                2,
-                b"[porrocket] getsockname() returning fake TCP info\n".as_ptr() as *const _,
-                50,
-            );
-            return 0;
-        }
-    }
-
-    // Not a converted socket, use original
-    original_getsockname(sockfd, addr, addrlen)
+    hook_getsockname(sockfd, addr, addrlen)
 }
 
-/// Intercept getsockopt to return fake TCP socket options
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn getpeername(
+    sockfd: c_int,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
+) -> c_int {
+    hook_getpeername(sockfd, addr, addrlen)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn close(fd: c_int) -> c_int {
+    hook_close(fd)
+}
+
+/// getsockopt() hook (Linux only): report AF_INET as the socket domain so that
+/// applications validating SO_DOMAIN don't notice the Unix socket swap.
+#[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn getsockopt(
     sockfd: c_int,
@@ -227,100 +353,122 @@ pub unsafe extern "C" fn getsockopt(
 ) -> c_int {
     initialize();
 
-    // Get the original function
-    let getsockopt_symbol = b"getsockopt\0".as_ptr() as *const i8;
-    let original = libc::dlsym(libc::RTLD_NEXT, getsockopt_symbol);
-    if original.is_null() {
+    let sym = libc::dlsym(libc::RTLD_NEXT, b"getsockopt\0".as_ptr() as *const _);
+    if sym.is_null() {
         return -1;
     }
-    let original_getsockopt: unsafe extern "C" fn(
+    let original: unsafe extern "C" fn(
         c_int,
         c_int,
         c_int,
         *mut libc::c_void,
         *mut socklen_t,
-    ) -> c_int = mem::transmute(original);
+    ) -> c_int = mem::transmute(sym);
 
-    // If this is a converted socket and asking for SO_DOMAIN, return AF_INET
-    if is_converted_socket(sockfd) && level == libc::SOL_SOCKET && optname == SO_DOMAIN {
-        if !optval.is_null() && !optlen.is_null() {
-            let domain_ptr = optval as *mut c_int;
-            *domain_ptr = AF_INET;
-            *optlen = mem::size_of::<c_int>() as socklen_t;
+    if is_converted_socket(sockfd)
+        && level == libc::SOL_SOCKET
+        && optname == SO_DOMAIN
+        && !optval.is_null()
+        && !optlen.is_null()
+    {
+        let domain_ptr = optval as *mut c_int;
+        *domain_ptr = AF_INET;
+        *optlen = mem::size_of::<c_int>() as socklen_t;
 
-            libc::write(
-                2,
-                b"[porrocket] getsockopt(SO_DOMAIN) returning AF_INET\n".as_ptr() as *const _,
-                52,
-            );
-            return 0;
-        }
+        libc::write(
+            2,
+            b"[porrocket] getsockopt(SO_DOMAIN) returning AF_INET\n".as_ptr() as *const _,
+            52,
+        );
+        return 0;
     }
 
-    // For other options, use original
-    original_getsockopt(sockfd, level, optname, optval, optlen)
+    original(sockfd, level, optname, optval, optlen)
 }
 
-/// Intercept getpeername to return fake peer address for converted sockets
-#[no_mangle]
-pub unsafe extern "C" fn getpeername(
+// ---------------------------------------------------------------------------
+// macOS: two-level namespaces make plain symbol shadowing ineffective. Instead
+// the hooks are wired up through the dyld __interpose table — an array of
+// {replacement, original} pointer pairs that dyld rewrites at load time.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn porrocket_bind(
+    sockfd: c_int,
+    addr: *const sockaddr,
+    addrlen: socklen_t,
+) -> c_int {
+    hook_bind(sockfd, addr, addrlen)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn porrocket_getsockname(
     sockfd: c_int,
     addr: *mut sockaddr,
     addrlen: *mut socklen_t,
 ) -> c_int {
-    initialize();
-
-    // Get the original function
-    let getpeername_symbol = b"getpeername\0".as_ptr() as *const i8;
-    let original = libc::dlsym(libc::RTLD_NEXT, getpeername_symbol);
-    if original.is_null() {
-        return -1;
-    }
-    let original_getpeername: unsafe extern "C" fn(c_int, *mut sockaddr, *mut socklen_t) -> c_int =
-        mem::transmute(original);
-
-    // If this is a converted socket, return fake TCP peer info
-    if is_converted_socket(sockfd) {
-        if !addr.is_null() && !addrlen.is_null() {
-            let fake_addr = addr as *mut sockaddr_in;
-            ptr::write_bytes(fake_addr, 0, 1);
-            (*fake_addr).sin_family = (AF_INET as u8).into();
-            (*fake_addr).sin_port = 0;
-            (*fake_addr).sin_addr.s_addr = libc::htonl(libc::INADDR_LOOPBACK);
-            *addrlen = mem::size_of::<sockaddr_in>() as socklen_t;
-
-            libc::write(
-                2,
-                b"[porrocket] getpeername() returning fake TCP peer\n".as_ptr() as *const _,
-                50,
-            );
-            return 0;
-        }
-    }
-
-    // Not a converted socket, use original
-    original_getpeername(sockfd, addr, addrlen)
+    hook_getsockname(sockfd, addr, addrlen)
 }
 
-/// Intercept close to stop tracking socket
-#[no_mangle]
-pub unsafe extern "C" fn close(fd: c_int) -> c_int {
-    // Untrack if it was a converted socket
-    untrack_converted_socket(fd);
-
-    // Call original close
-    let close_symbol = b"close\0".as_ptr() as *const i8;
-    let original = libc::dlsym(libc::RTLD_NEXT, close_symbol);
-    if original.is_null() {
-        return -1;
-    }
-    let original_close: unsafe extern "C" fn(c_int) -> c_int = mem::transmute(original);
-    original_close(fd)
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn porrocket_getpeername(
+    sockfd: c_int,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
+) -> c_int {
+    hook_getpeername(sockfd, addr, addrlen)
 }
 
-// Constructor to run when library is loaded (Linux only)
+// NOTE: close() is intentionally NOT interposed on macOS. It is called
+// constantly and very early in process startup; interposing it risks
+// re-entrancy during dyld/libsystem initialization. Converted sockets are
+// long-lived listeners, so skipping close-tracking is harmless here.
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Interpose {
+    replacement: *const (),
+    original: *const (),
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Sync for Interpose {}
+
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__interpose"]
+static INTERPOSE_BIND: Interpose = Interpose {
+    replacement: porrocket_bind as *const (),
+    original: libc::bind as *const (),
+};
+
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__interpose"]
+static INTERPOSE_GETSOCKNAME: Interpose = Interpose {
+    replacement: porrocket_getsockname as *const (),
+    original: libc::getsockname as *const (),
+};
+
+#[cfg(target_os = "macos")]
+#[used]
+#[link_section = "__DATA,__interpose"]
+static INTERPOSE_GETPEERNAME: Interpose = Interpose {
+    replacement: porrocket_getpeername as *const (),
+    original: libc::getpeername as *const (),
+};
+
+// ---------------------------------------------------------------------------
+// Constructor: runs when the library is loaded, before the target's main().
+// ---------------------------------------------------------------------------
+
 #[cfg(target_os = "linux")]
 #[link_section = ".init_array"]
+#[used]
+pub static INITIALIZE_CTOR: extern "C" fn() = init_hook;
+
+#[cfg(target_os = "macos")]
+#[link_section = "__DATA,__mod_init_func"]
 #[used]
 pub static INITIALIZE_CTOR: extern "C" fn() = init_hook;
 

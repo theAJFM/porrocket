@@ -1,6 +1,6 @@
 # porrocket
 
-A Linux command-line tool that intercepts TCP port bindings and redirects them to Unix domain sockets using LD_PRELOAD.
+A Linux and macOS command-line tool that intercepts TCP port bindings and redirects them to Unix domain sockets via library injection.
 
 ---
 
@@ -37,11 +37,19 @@ This will make the Node.js process bind to `/tmp/app.sock` instead of port 4312.
 
 ## How It Works
 
-`porrocket` uses `LD_PRELOAD` to inject a shared library that hooks the `bind()` system call. When the target application attempts to bind to the specified port, our hook library redirects it to bind to a Unix domain socket instead.
+`porrocket` injects a small hook library into the target process that hooks the
+`bind()` system call. When the target application attempts to bind to the
+specified port, the hook redirects it to bind to a Unix domain socket instead.
+
+- **Linux:** the hook library is injected via `LD_PRELOAD` and shadows the libc
+  `bind()`/`getsockname()`/`getpeername()`/`getsockopt()`/`close()` symbols.
+- **macOS:** the hook library is injected via `DYLD_INSERT_LIBRARIES` and wired
+  up through the dyld `__interpose` table, which works correctly with macOS's
+  two-level namespaces.
 
 ## Platform Support
 
-**Linux only** - This tool is designed specifically for Linux and uses `LD_PRELOAD` for library injection.
+**Linux and macOS.**
 
 ### What Works
 
@@ -57,21 +65,37 @@ This will make the Node.js process bind to `/tmp/app.sock` instead of port 4312.
 - ❌ Programs using `seccomp` or other security sandboxing
 - ❌ Programs that don't use the standard `bind()` syscall
 
-### Why Not macOS/Windows?
+### macOS notes
 
-- **macOS**: System Integrity Protection (SIP) and code signing prevent `DYLD_INSERT_LIBRARIES` from working reliably. Modern macOS uses two-level namespaces which make simple function interposition ineffective.
-- **Windows**: Different architecture entirely; would require DLL injection which has similar security restrictions.
+On macOS, dyld silently strips `DYLD_INSERT_LIBRARIES` for **restricted
+binaries** — Apple platform binaries under SIP-protected paths (`/usr/bin`,
+`/bin`, `/System`, …), `setuid` binaries, and binaries whose hardened runtime
+enables library validation. porrocket supports only **non-restricted** target
+binaries, which covers Homebrew/dev-installed interpreters (Node, Python, Ruby,
+…) and your own compiled Go/Rust/C servers.
+
+If the hook never loads, porrocket detects it and prints a clear warning after
+the target exits. Workaround: invoke a non-restricted copy of the interpreter
+(e.g. a Homebrew install) rather than the Apple-provided one.
+
+### Why Not Windows?
+
+Different architecture entirely; would require DLL injection, which has similar
+security restrictions.
 
 ## Installation
 
 ### Prerequisites
 
 ```bash
-# Debian/Ubuntu
+# Linux (Debian/Ubuntu)
 sudo apt-get update
 sudo apt-get install build-essential
 
-# Install Rust (if not already installed)
+# macOS
+xcode-select --install   # provides the compiler/linker and codesign
+
+# Install Rust (if not already installed, both platforms)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
@@ -92,8 +116,10 @@ cargo build --release
 
 The install script will:
 - Build the release version
-- Install `porrocket` binary to `~/.cargo/bin/`
-- Install `libporrocket_hook.so` to the same directory
+- Install the `porrocket` binary to `~/.cargo/bin/`
+- Install the hook library (`libporrocket_hook.so` on Linux,
+  `libporrocket_hook.dylib` on macOS) to the same directory
+- Ad-hoc codesign the hook library on macOS
 - Verify your PATH is configured correctly
 
 **Note:** Do not use `cargo install --path porrocket` as it only installs the binary, not the required shared library.
@@ -141,8 +167,8 @@ lsof -i :4312  # Should show nothing
 
 The project consists of two components:
 
-1. **porrocket** (binary): CLI tool that spawns the target command with the hook library injected via `LD_PRELOAD`
-2. **porrocket-hook** (shared library): `.so` file that intercepts `bind()` calls and redirects them to Unix sockets
+1. **porrocket** (binary): CLI tool that spawns the target command with the hook library injected (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS)
+2. **porrocket-hook** (shared library): `.so` (Linux) / `.dylib` (macOS) that intercepts `bind()` calls and redirects them to Unix sockets
 
 ## Runtime Compatibility
 
@@ -185,17 +211,27 @@ The project consists of two components:
 
 ### "Hook library not found" error
 
-The binary looks for `libporrocket_hook.so` in the same directory. If you used `cargo install`, both files should be in `~/.cargo/bin/`.
+The binary looks for the hook library (`libporrocket_hook.so` on Linux,
+`libporrocket_hook.dylib` on macOS) in the same directory. After `./install.sh`
+both files are in `~/.cargo/bin/`.
 
 ### Library not loading
 
 ```bash
-# Check if LD_PRELOAD works
+# Linux: check if LD_PRELOAD works
 LD_PRELOAD=/path/to/libporrocket_hook.so python3 -c "print('test')"
-
-# Check library dependencies
 ldd target/release/libporrocket_hook.so
+
+# macOS: check if DYLD_INSERT_LIBRARIES works
+DYLD_INSERT_LIBRARIES=/path/to/libporrocket_hook.dylib python3 -c "print('test')"
+otool -L target/release/libporrocket_hook.dylib
 ```
+
+### macOS: "the hook library was never loaded" warning
+
+dyld stripped `DYLD_INSERT_LIBRARIES` because the target is a restricted binary.
+Run a non-restricted interpreter instead (e.g. a Homebrew-installed `python3`/
+`node` rather than the Apple-provided one). See **macOS notes** above.
 
 ### Port still being used
 

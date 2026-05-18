@@ -2,7 +2,9 @@
 
 ## Platform Requirements
 
-**Linux only** - porrocket is designed specifically for Linux systems. It will not compile on macOS or Windows.
+**Linux and macOS.** porrocket does not compile on Windows. On macOS, only
+non-restricted target binaries are supported (see the macOS notes in
+[README.md](README.md)).
 
 ## Prerequisites
 
@@ -39,6 +41,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
+### macOS
+```bash
+# Install the command-line tools (compiler, linker, codesign)
+xcode-select --install
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
 ## Building from Source
 
 ```bash
@@ -50,20 +62,25 @@ cargo build --release
 
 # The binaries will be in target/release/:
 # - porrocket (main executable)
-# - libporrocket_hook.so (hook library)
+# - libporrocket_hook.so   (hook library, Linux)
+# - libporrocket_hook.dylib (hook library, macOS)
 ```
 
 ## Installation Options
 
 ### Option 1: Install to User Directory (Recommended)
 ```bash
-# Install to ~/.cargo/bin (automatically in PATH)
-cargo install --path porrocket
+# Builds, installs the binary + hook library to ~/.cargo/bin, and
+# ad-hoc codesigns the hook library on macOS.
+./install.sh
 
 # Verify installation
 which porrocket
 porrocket --help
 ```
+
+> Do not use `cargo install --path porrocket` — it installs only the binary,
+> not the required hook library (and does not codesign it on macOS).
 
 ### Option 2: Use from Build Directory
 ```bash
@@ -73,12 +90,14 @@ porrocket --help
 
 ### Option 3: System-wide Installation
 ```bash
-# Copy both files to system directories
+# The binary looks for the hook library in its OWN directory, so both files
+# must live together. Pick the hook name for your platform:
+#   Linux: libporrocket_hook.so   macOS: libporrocket_hook.dylib
 sudo cp target/release/porrocket /usr/local/bin/
-sudo cp target/release/libporrocket_hook.so /usr/local/lib/
+sudo cp target/release/libporrocket_hook.* /usr/local/bin/
 
-# Note: The binary looks for the .so in the same directory as the executable
-# So this approach requires the library to be accessible
+# macOS only: ad-hoc codesign the hook library
+sudo codesign -s - -f /usr/local/bin/libporrocket_hook.dylib
 ```
 
 ## Verifying Installation
@@ -131,8 +150,8 @@ rm /tmp/test.sock
 
 ### Compilation Errors
 
-**Error: "Unsupported platform"**
-- porrocket only compiles on Linux. You cannot build it on macOS or Windows.
+**Error: "porrocket only supports Linux and macOS"**
+- porrocket does not compile on Windows or other platforms.
 
 **Error: "linker 'cc' not found"**
 ```bash
@@ -145,16 +164,24 @@ sudo dnf groupinstall "Development Tools"  # Fedora/RHEL
 
 **Error: "Hook library not found"**
 
-The porrocket binary looks for `libporrocket_hook.so` in the same directory:
+The porrocket binary looks for the hook library in the same directory
+(`libporrocket_hook.so` on Linux, `libporrocket_hook.dylib` on macOS):
 
 ```bash
-# If using cargo install, check both files are together
+# Check both files are together
 ls ~/.cargo/bin/porrocket
-ls ~/.cargo/bin/libporrocket_hook.so
+ls ~/.cargo/bin/libporrocket_hook.*
 
 # If one is missing, reinstall
-cargo install --path porrocket --force
+./install.sh
 ```
+
+**macOS: "the hook library was never loaded" warning**
+
+dyld stripped `DYLD_INSERT_LIBRARIES` because the target is a restricted binary
+(SIP-protected path, hardened runtime with library validation, or `setuid`).
+Run a non-restricted interpreter — e.g. a Homebrew-installed `python3`/`node`
+rather than the Apple-provided one.
 
 **Error: Permission denied**
 ```bash
@@ -167,27 +194,26 @@ mkdir -p /tmp && ls -la /tmp
 
 ### Library Loading Issues
 
-**Test if LD_PRELOAD works:**
+**Test that injection works:**
 ```bash
-# This should work without errors
+# Linux
 LD_PRELOAD=/path/to/libporrocket_hook.so python3 -c "print('test')"
-```
-
-**Check library dependencies:**
-```bash
-# All dependencies should be satisfied
 ldd target/release/libporrocket_hook.so
+
+# macOS
+DYLD_INSERT_LIBRARIES=/path/to/libporrocket_hook.dylib python3 -c "print('test')"
+otool -L target/release/libporrocket_hook.dylib
 ```
 
 ## Uninstallation
 
 ```bash
-# If installed via cargo install
-cargo uninstall porrocket
+# If installed via ./install.sh
+./uninstall.sh
 
 # If installed manually to system directories
 sudo rm /usr/local/bin/porrocket
-sudo rm /usr/local/lib/libporrocket_hook.so
+sudo rm /usr/local/bin/libporrocket_hook.*
 
 # Clean up build artifacts
 cargo clean
