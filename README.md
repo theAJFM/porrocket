@@ -182,7 +182,7 @@ The project consists of two components:
 
 ### ❌ Known Incompatible
 
-- **Deno** - Strict socket validation prevents compatibility
+- **Deno** - Accepts connections, but its async runtime (tokio) never drives I/O on the redirected socket; requests hang. See [examples/README.md](examples/README.md#deno)
 - **Python http.server** - Crashes on client address logging
 - **Static binaries** - No libc to hook
 - **Setuid/setgid binaries** - Security restriction
