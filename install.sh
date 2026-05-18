@@ -10,6 +10,13 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}Building porrocket...${NC}"
 cargo build --release
 
+# Determine the hook library name for this platform
+if [ "$(uname -s)" = "Darwin" ]; then
+    HOOK_LIB="libporrocket_hook.dylib"
+else
+    HOOK_LIB="libporrocket_hook.so"
+fi
+
 # Determine install directory
 if [ -n "$PREFIX" ]; then
     INSTALL_DIR="$PREFIX/bin"
@@ -27,14 +34,21 @@ cp target/release/porrocket "$INSTALL_DIR/porrocket"
 echo -e "${GREEN}✓${NC} Installed porrocket binary"
 
 # Copy the hook library to the same directory as the binary
-cp target/release/libporrocket_hook.so "$INSTALL_DIR/libporrocket_hook.so"
-echo -e "${GREEN}✓${NC} Installed libporrocket_hook.so"
+cp "target/release/$HOOK_LIB" "$INSTALL_DIR/$HOOK_LIB"
+echo -e "${GREEN}✓${NC} Installed $HOOK_LIB"
+
+# On macOS, ad-hoc codesign the hook so dyld will load it via
+# DYLD_INSERT_LIBRARIES into non-restricted targets.
+if [ "$(uname -s)" = "Darwin" ]; then
+    codesign -s - -f "$INSTALL_DIR/$HOOK_LIB"
+    echo -e "${GREEN}✓${NC} Ad-hoc codesigned $HOOK_LIB"
+fi
 
 echo ""
 echo -e "${GREEN}Installation complete!${NC}"
 echo ""
 echo -e "Binary installed to:  ${YELLOW}$INSTALL_DIR/porrocket${NC}"
-echo -e "Library installed to: ${YELLOW}$INSTALL_DIR/libporrocket_hook.so${NC}"
+echo -e "Library installed to: ${YELLOW}$INSTALL_DIR/$HOOK_LIB${NC}"
 echo ""
 
 # Check if install dir is in PATH

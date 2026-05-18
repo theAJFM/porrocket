@@ -61,9 +61,22 @@ porrocket -p 4312 -u /tmp/deno.sock -- deno run --allow-net test_server_deno.js 
 ```
 
 **Why it doesn't work:**
-- Deno performs strict socket type validation at the JavaScript/TypeScript layer
-- Uses `getsockopt(SO_DOMAIN)` and other introspection that reveals the socket is not actually TCP
-- Rejects sockets that don't match expected types
+
+The redirected Unix socket itself is fine — `bind()`, `listen()`,
+`getsockname()`, `getpeername()` and `accept()` all succeed, and the kernel
+reports the accepted connection as immediately readable and writable. Deno
+even accepts incoming connections.
+
+The blocker is inside Deno's async runtime (tokio/mio). After accepting a
+connection, Deno's reactor never drives any I/O on the connection fd — no
+`read`/`write` syscall is ever issued, so requests hang. Node works because
+libuv performs *speculative* I/O (it tries `write()`/`read()` immediately and
+only falls back to polling on `EAGAIN`); tokio instead waits for a kqueue
+readiness event that, for the redirected socket, never advances the I/O op.
+Both the low-level `Deno.listen` API and the modern `Deno.serve` API hit this.
+
+This is a runtime-internals issue, not something library injection can fix —
+it would require changing how Deno's reactor schedules I/O.
 
 **Alternatives for Deno users:**
 - Configure Deno apps to use Unix sockets natively (some frameworks support this)
@@ -110,7 +123,7 @@ socat - UNIX-CONNECT:/tmp/test.sock
 
 **Symptom:** Application fails immediately on startup
 
-**Cause:** Application performs socket validation before binding (like Deno)
+**Cause:** Application performs strict socket validation before binding
 
 **Solution:** This application is incompatible with porrocket. Use native Unix socket support or a reverse proxy instead.
 
