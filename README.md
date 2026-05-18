@@ -178,8 +178,7 @@ The project consists of two components:
 - **Python (custom servers)** - Works with manual socket handling (see examples)
 - **Simple C/C++ servers** - Usually works
 - **Go applications** - Generally works
-- **Rust (tokio/std)** - Works, including axum
-- **Leptos SSR (axum)** - Works; run the `cargo-leptos` server binary under porrocket on its `site-addr` port (see [examples/leptos-repro](examples/leptos-repro/))
+- **Rust (tokio/std)** - Generally works. Tested on axum + leptos (see [examples/leptos-repro](examples/leptos-repro/))
 
 ### ❌ Known Incompatible
 
