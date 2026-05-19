@@ -81,7 +81,8 @@ the target exits. Workaround: invoke a non-restricted copy of the interpreter
 ### Why Not Windows?
 
 Different architecture entirely; would require DLL injection, which has similar
-security restrictions.
+security restrictions as MacOS. Unfortunately, I don't have access to a Windows
+machine to test porrocket there (for now).
 
 ## Installation
 
