@@ -4,6 +4,9 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use std::env;
 use std::fs;
+use std::os::fd::{IntoRawFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +20,20 @@ compile_error!("porrocket only supports Linux and macOS.");
 #[command(about = "Redirect TCP port bindings to Unix sockets", long_about = None)]
 struct Args {
     /// Port number to intercept
-    #[arg(short, long)]
-    port: u16,
+    #[arg(
+        short,
+        long,
+        required_unless_present = "listenfd",
+        conflicts_with = "listenfd"
+    )]
+    port: Option<u16>,
+
+    /// Bind the Unix socket here and pass it to the command through systemd socket activation
+    /// (fd 3, `LISTEN_FDS=1`, `LISTEN_PID`), then exec the command in place of porrocket.
+    /// For servers that accept an inherited listener, such as `wasmtime serve --systemd-listenfd`;
+    /// no hook library is loaded.
+    #[arg(long)]
+    listenfd: bool,
 
     /// Unix socket path to redirect to
     #[arg(short = 'u', long)]
@@ -59,6 +74,49 @@ fn cleanup_socket(socket_path: &PathBuf) {
     }
 }
 
+/// First descriptor of the systemd socket-activation protocol (`SD_LISTEN_FDS_START`).
+const LISTEN_FDS_START: RawFd = 3;
+
+/// Binds `socket_path`, places the listener on fd 3 and execs `command` with the systemd
+/// socket-activation environment. `exec` keeps this process's PID, which is what makes
+/// `LISTEN_PID` match in the command. Only returns on failure.
+fn exec_with_listenfd(socket_path: &PathBuf, command: &[String]) -> Result<()> {
+    if socket_path.exists() {
+        fs::remove_file(socket_path)
+            .with_context(|| format!("Failed to remove stale socket {}", socket_path.display()))?;
+    }
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("Failed to bind {}", socket_path.display()))?;
+    let fd = listener.into_raw_fd();
+
+    if fd != LISTEN_FDS_START {
+        // dup2 leaves FD_CLOEXEC clear on the new descriptor.
+        if unsafe { libc::dup2(fd, LISTEN_FDS_START) } < 0 {
+            bail!("dup2 onto fd 3 failed: {}", std::io::Error::last_os_error());
+        }
+        unsafe { libc::close(fd) };
+    } else {
+        // std opens sockets close-on-exec; the listener has to survive the exec.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            bail!(
+                "Failed to clear FD_CLOEXEC on fd 3: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    let (cmd, cmd_args) = command.split_first().context("No command specified")?;
+    let err = Command::new(cmd)
+        .args(cmd_args)
+        .env("LISTEN_FDS", "1")
+        .env("LISTEN_PID", std::process::id().to_string())
+        .env("LISTEN_FDNAMES", "porrocket")
+        .exec();
+    cleanup_socket(socket_path);
+    Err(err).with_context(|| format!("Failed to exec {cmd}"))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -66,6 +124,11 @@ fn main() -> Result<()> {
     if args.command.is_empty() {
         bail!("No command specified");
     }
+
+    if args.listenfd {
+        return exec_with_listenfd(&args.socket, &args.command);
+    }
+    let port = args.port.context("--port is required without --listenfd")?;
 
     // Get the hook library path
     let hook_lib = get_hook_library_path()
@@ -86,7 +149,7 @@ fn main() -> Result<()> {
     command.args(cmd_args);
 
     // Set environment variables for the hook
-    command.env("PORROCKET_PORT", args.port.to_string());
+    command.env("PORROCKET_PORT", port.to_string());
     command.env("PORROCKET_SOCKET", args.socket.to_str().unwrap_or(""));
 
     // Marker file so we can detect whether the hook actually loaded. On macOS,
