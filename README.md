@@ -35,6 +35,29 @@ porrocket -p 4312 -u /tmp/app.sock -- node server.js
 
 This will make the Node.js process bind to `/tmp/app.sock` instead of port 4312.
 
+### Socket activation (`--listenfd`)
+
+```bash
+porrocket --listenfd -u <socket_path> -- <command>
+```
+
+For servers that can accept an already-bound listener through systemd socket
+activation, `--listenfd` skips the hook entirely. porrocket binds the Unix
+socket itself, places it on fd 3, sets `LISTEN_FDS=1`, `LISTEN_PID` and
+`LISTEN_FDNAMES=porrocket`, then `exec`s the command in its own place. Because
+`exec` keeps the PID, `LISTEN_PID` matches in the command, which strict
+implementations check.
+
+```bash
+porrocket --listenfd -u /tmp/app.sock -- wasmtime serve --systemd-listenfd app.wasm
+```
+
+This mode works with statically linked binaries and runtimes the hook cannot
+drive, since nothing is injected. A wrapper between porrocket and the server
+must also `exec` rather than fork (`unshare -rn` does; a forking launcher
+breaks the `LISTEN_PID` match). porrocket is replaced by the command, so the
+socket file is not removed when the server exits.
+
 ## How It Works
 
 `porrocket` injects a small hook library into the target process that hooks the
